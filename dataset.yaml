@@ -1,0 +1,11 @@
+# Caminho absoluto para a pasta raiz do dataset. Esta é a forma mais segura.
+path: 'c:/Users/ti-005/Desktop/pvcf_gpt/dataset'
+
+# Pastas de treino e validação (relativas ao 'path')
+# Como nosso dataset é pequeno, usaremos o mesmo conjunto para ambos.
+train: images
+val: images
+
+# Definição das Classes
+nc: 1  # número de classes (temos apenas 1: "item")
+names: ['item'] # nomes das classes
