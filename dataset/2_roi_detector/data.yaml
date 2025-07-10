@@ -1,0 +1,10 @@
+# Configuração para o dataset de detecção da ROI (caixa principal)
+path: 'c:/Users/ti-005/Desktop/pvcf_gpt/dataset/2_roi_detector'
+
+# Pastas de treino e validação (relativas ao 'path')
+train: images
+val: images
+
+# Definição das Classes
+nc: 1
+names: ['caixa_principal']
