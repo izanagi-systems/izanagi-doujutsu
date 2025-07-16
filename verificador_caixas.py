@@ -1,206 +1,184 @@
+import os
+# SOLUÇÃO DEFINITIVA PARA ERRO DE REDE: Impede a biblioteca de verificar atualizações online.
+os.environ['ULTRALYTICS_SYNC'] = 'False'
+
 import cv2
 import os
 from ultralytics import YOLO
 import numpy as np
 from collections import deque
+import argparse
 
 class ContadorDeItens:
-    def __init__(self, video_source=0, item_model_path='runs/detect/contador_itens_aug2/weights/best.pt', roi_model_path='path/to/roi_model.pt', perfil_caixa=None, timeout_alarme=50):
+    def __init__(self, item_model_path='runs/detect/contador_multiclasse_final/weights/best.pt', roi_model_path='path/to/roi_model.pt', perfil_caixa=None, timeout_alarme=50, conf_threshold=0.4):
         """
         Inicializa o contador de itens.
-        :param video_source: Fonte do vídeo (0 para webcam, ou caminho para arquivo).
         :param item_model_path: Caminho para o modelo YOLO treinado para contar itens.
         :param roi_model_path: Caminho para o modelo YOLO treinado para detectar a caixa principal (ROI).
         :param perfil_caixa: Dicionário com o perfil da caixa (nome, itens_esperados).
         :param timeout_alarme: Frames para esperar antes de alarmar.
+        :param conf_threshold: Limite de confiança para detecções de itens.
         """
         print(f"[INFO] Carregando modelos...")
         self.item_model = YOLO(item_model_path)
         self.roi_model = YOLO(roi_model_path)
         print(f"[INFO] Modelos carregados com sucesso.")
 
-        self.video_source = video_source
         self.perfil_caixa = perfil_caixa
+        self.conf_threshold = conf_threshold # Armazena o limite de confiança
         if self.perfil_caixa:
-            print(f"[INFO] Perfil carregado: {self.perfil_caixa['nome']} (Esperando {self.perfil_caixa['itens_esperados']} itens)")
+            print(f"[INFO] Perfil carregado: {self.perfil_caixa['nome']} (Esperando {self.perfil_caixa['itens_esperados']} itens por camada para {self.perfil_caixa['total_camadas']} camadas)")
         else:
-            print("[AVISO] Nenhum perfil de caixa carregado. O sistema funcionará em modo de contagem simples.")
+            print("[AVISO] Nenhum perfil de caixa carregado. A contagem será apenas exibida.")
 
-        # Detecção do tipo de fonte
-        self.is_image = False
-        self.is_live = False
-        self.cap = None
+        # --- Estados do Sistema ---
+        self.status_caixa = 'AGUARDANDO_CAIXA'
+        self.roi_atual = None
+        self.roi_travada = False
+        self.frames_sem_roi = 0
+        self.timeout_sem_roi = timeout_alarme # Frames para esperar antes de resetar
+        self.contagem_buffer = deque(maxlen=15) # Buffer para suavizar a contagem
+        self.camada_atual = 1
 
-        if isinstance(video_source, int):
-            self.is_live = True
-        elif isinstance(video_source, str):
-            img_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-            if any(video_source.lower().endswith(ext) for ext in img_extensions):
-                self.is_image = True
+    def run(self, imagem_path=None, video_source=0):
+        if imagem_path:
+            print(f"[INFO] Processando imagem única: {imagem_path}")
+            self._processar_imagem_unica(imagem_path)
+        elif isinstance(video_source, str): # Caminho para arquivo de vídeo
+            print("[INFO] Iniciando modo Arquivo de Vídeo.")
+            self._loop_video_file(video_source)
+        else: # Câmera ao vivo
+            print("[INFO] Iniciando modo Câmera ao Vivo. Pressione 'q' para sair.")
+            self._loop_live_camera(video_source)
+
+    def _processar_imagem_unica(self, imagem_path):
+        """
+        Processa uma única imagem, realiza a detecção e exibe o resultado.
+        """
+        frame = cv2.imread(imagem_path)
+        if frame is None:
+            print(f"[ERRO] Não foi possível carregar a imagem: {imagem_path}")
+            return
+
+        # Roda a detecção
+        results = self.item_model(frame, verbose=False, conf=self.conf_threshold)
+        frame_desenhado = frame.copy() # Cria uma cópia para desenhar
+
+        # Loop manual para desenhar cada detecção
+        for box in results[0].boxes:
+            x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+            conf = float(box.conf)
+            cls = int(box.cls)
+            label = f'{self.item_model.names[cls]} {conf:.2f}'
+            
+            # Define a cor baseada na classe (item = azul, divisor = ciano/amarelo)
+            color = (255, 0, 0) if cls == 0 else (0, 255, 255)
+
+            # Desenha o retângulo e o texto
+            cv2.rectangle(frame_desenhado, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame_desenhado, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        contagem, roi_desenho = self._gerenciar_ciclo_de_vida(frame)
+        self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho)
+
+        cv2.imshow('SIAC - Verificador de Caixas', frame_desenhado)
+
+    def _gerenciar_ciclo_de_vida(self, frame):
+        """
+        Gerencia o estado da detecção da caixa (ROI) e a contagem de itens.
+        Retorna a contagem de itens e as coordenadas da ROI para desenho.
+        """
+        # 1. Detectar a ROI (caixa principal)
+        roi_results = self.roi_model(frame, verbose=False, conf=0.5)
+        caixas_detectadas = roi_results[0].boxes.xyxy
         
-        if not self.is_image:
-            self.cap = cv2.VideoCapture(video_source)
-            if not self.cap.isOpened():
-                raise IOError(f"Não foi possível acessar a fonte de vídeo: {video_source}.")
+        roi_para_desenho = None
+        contagem_final = 0
 
-        # Variáveis para o rastreamento da ROI
-        self.caixa_roi = None # (x, y, w, h) da caixa atual
+        if len(caixas_detectadas) > 0:
+            # Pega a maior caixa detectada como a ROI principal
+            areas = [(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in caixas_detectadas]
+            maior_caixa_idx = np.argmax(areas)
+            x1, y1, x2, y2 = caixas_detectadas[maior_caixa_idx]
+            self.roi_atual = [int(x1), int(y1), int(x2), int(y2)]
+            roi_para_desenho = self.roi_atual
+            self.frames_sem_roi = 0
+            self.status_caixa = 'CAIXA_PRESENTE'
 
-        # Variáveis para o ciclo de vida e alarme
-        self.status_caixa = "PROCURANDO"    # Estados: PROCURANDO, ATIVA, PERDIDA
-        self.caixa_ativa = None             # A ROI confirmada e que está sendo monitorada
-        self.frames_sem_caixa = 0           # Contador de frames desde que a caixa foi perdida
-        self.roi_candidata = None           # Uma ROI detectada que pode se tornar a caixa_ativa
-        self.contador_frames_estaveis = 0   # Contador para confirmar se uma ROI é estável
+        else: # Nenhuma caixa detectada
+            self.frames_sem_roi += 1
+            if self.frames_sem_roi > self.timeout_sem_roi:
+                # Se a caixa sumiu por tempo suficiente, reseta o estado
+                self.status_caixa = 'AGUARDANDO_CAIXA'
+                self.roi_atual = None
+                self.contagem_buffer.clear()
+                self.camada_atual = 1
 
-        # Constantes de configuração do ciclo de vida
-        self.FRAMES_PARA_CONFIRMAR_ROI = 10 # Uma ROI precisa estar estável por 10 frames
-        self.FRAMES_DE_CARENCIA = 30        # O operador tem 30 frames para a caixa voltar antes do alarme
+        # 2. Se a caixa está presente, conta os itens dentro dela
+        if self.status_caixa == 'CAIXA_PRESENTE' and self.roi_atual:
+            x1, y1, x2, y2 = self.roi_atual
+            roi_frame = frame[y1:y2, x1:x2]
 
-        # NOVO: Histórico das últimas contagens para robustez
-        self.TAMANHO_HISTORICO = 15 # Armazena as últimas 15 contagens
-        self.historico_contagens = deque(maxlen=self.TAMANHO_HISTORICO)
-
-    def _gerenciar_ciclo_caixa(self, frame):
-        """
-        Gerencia a máquina de estados do ciclo de vida da caixa.
-        Retorna a contagem atual e a ROI a ser desenhada.
-        """
-        contagem_atual = 0
-        roi_para_desenhar = None
-
-        # Tenta detectar uma ROI em qualquer estado, para sabermos se a caixa está visível
-        roi_detectada_neste_frame = self._detectar_caixa_roi(frame)
-
-        # --- MÁQUINA DE ESTADOS ---
-        if self.status_caixa == "PROCURANDO":
-            roi_para_desenhar = roi_detectada_neste_frame
-            if roi_detectada_neste_frame:
-                self.contador_frames_estaveis += 1
-                if self.contador_frames_estaveis >= self.FRAMES_PARA_CONFIRMAR_ROI:
-                    self.caixa_ativa = roi_detectada_neste_frame
-                    self.status_caixa = "ATIVA"
-                    print(f"\n[STATUS] Caixa ATIVA. Monitorando conteúdo.")
-                    self.historico_contagens.clear() # Limpa o histórico para a nova caixa
+            if roi_frame.size > 0:
+                item_results = self.item_model(roi_frame, verbose=False, conf=self.conf_threshold)
+                # Filtra apenas a classe 'item' (ID 0)
+                contagem_itens = sum(1 for box in item_results[0].boxes if int(box.cls) == 0)
+                self.contagem_buffer.append(contagem_itens)
+            
+            # Usa a média do buffer para estabilizar a contagem
+            if self.contagem_buffer:
+                contagem_final = int(np.mean(self.contagem_buffer))
             else:
-                self.contador_frames_estaveis = 0 # Zera se a caixa sumir
-
-        elif self.status_caixa == "ATIVA":
-            if roi_detectada_neste_frame:
-                self.caixa_ativa = roi_detectada_neste_frame # Atualiza a posição da ROI ativa
-                roi_para_desenhar = self.caixa_ativa
-                self.frames_sem_caixa = 0 # Zera o contador de ausência
-
-                # OTIMIZAÇÃO: Só executa a contagem de itens quando a caixa está ativa
-                results = self.item_model(frame, verbose=False)
-                # CORREÇÃO: Passa a ROI ativa para a função de contagem
-                contagem_frame_atual = self._contar_itens_na_roi(results[0], self.caixa_ativa)
-                self.historico_contagens.append(contagem_frame_atual) # Adiciona contagem ao histórico
-                
-                # A contagem exibida é a máxima do histórico recente para estabilidade visual
-                contagem_atual = max(self.historico_contagens, default=0)
-
-            else:
-                # A caixa sumiu! Inicia o período de carência.
-                self.status_caixa = "PERDIDA"
-                self.frames_sem_caixa = 1
-                print(f"\n[STATUS] Caixa PERDIDA. Iniciando timer de carência...")
-
-        elif self.status_caixa == "PERDIDA":
-            if roi_detectada_neste_frame:
-                # A caixa voltou a tempo!
-                self.status_caixa = "ATIVA"
-                self.frames_sem_caixa = 0
-                print(f"\n[STATUS] Caixa re-detectada. Voltando a monitorar.")
-            else:
-                self.frames_sem_caixa += 1
-                if self.frames_sem_caixa > self.FRAMES_DE_CARENCIA:
-                    # Fim do timeout. Avalia a contagem e dispara o alarme se necessário.
-                    contagem_final_confiavel = max(self.historico_contagens, default=0)
-                    
-                    if contagem_final_confiavel < self.perfil_caixa['itens_esperados']:
-                        print(f"\n[ALARME] CAIXA REMOVIDA INCOMPLETA!")
-                        print(f"    -> Itens contados: {contagem_final_confiavel} / {self.perfil_caixa['itens_esperados']}")
-                    else:
-                        print(f"\n[INFO] Caixa removida COMPLETA. Tudo certo.")
-                    
-                    # Resetar tudo e voltar a procurar
-                    self.status_caixa = "PROCURANDO"
-                    self.caixa_ativa = None
-                    self.ultima_contagem_valida = 0
-                    self.frames_sem_caixa = 0
-                    self.contador_frames_estaveis = 0
-
-        return contagem_atual, roi_para_desenhar
-
-    def _detectar_caixa_roi(self, frame):
-        """
-        Detecta a caixa principal (ROI) usando um modelo YOLO dedicado.
-        Retorna a bounding box (x, y, w, h) da primeira caixa encontrada ou None.
-        """
-        # Assume que a classe da caixa principal é 0
-        results = self.roi_model(frame, verbose=False, classes=[0], conf=0.6)
-
-        for result in results:
-            if len(result.boxes) > 0:
-                # Pega a caixa com a maior confiança
-                best_box = result.boxes[0]
-                x1, y1, x2, y2 = best_box.xyxy[0].cpu().numpy().astype(int)
-                w, h = x2 - x1, y2 - y1
-                return (x1, y1, w, h)
+                contagem_final = 0
         
-        return None
+        return contagem_final, roi_para_desenho
 
-    def _contar_itens_na_roi(self, result, caixa_roi):
+    def _desenhar_visualizacoes(self, frame, contagem, roi_desenho):
         """
-        Filtra e conta as detecções do YOLO que estão dentro da ROI da caixa.
+        Desenha as informações de contagem e ROI no frame.
+{{ ... }}
+            cv2.putText(frame, "ROI Caixa", (x, y - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
         """
-        if caixa_roi is None:
-            return 0 # Se não há ROI, não há itens para contar dentro dela.
-
-        contagem_na_roi = 0
-        cx, cy, cw, ch = caixa_roi
-
-        for box in result.boxes:
-            # Pega o centro da caixa de detecção do item
-            item_x1, item_y1, item_x2, item_y2 = box.xyxy[0]
-            centro_x = (item_x1 + item_x2) / 2
-            centro_y = (item_y1 + item_y2) / 2
-
-            # Verifica se o centro do item está dentro da ROI
-            if cx < centro_x < cx + cw and cy < centro_y < cy + ch:
-                contagem_na_roi += 1
-        
-        return contagem_na_roi
-
-    def _loop_video_file(self):
+    def _loop_video_file(self, video_source):
         """
         Loop de processamento para arquivos de vídeo com controles de player.
         Espaço: Play/Pause. 'd'/'a': Frame a frame (quando pausado). 'q': Sair.
         """
+        self.cap = cv2.VideoCapture(video_source)
+        if not self.cap.isOpened():
+            print(f"[ERRO] Não foi possível abrir o arquivo de vídeo: {video_source}")
+            return
+
         paused = True
         ret, frame = self.cap.read()
 
         while True:
-            if ret: # Só processa e exibe se o frame for válido
-                # --- LÓGICA DE DETECÇÃO ---
-                contagem, roi_desenho = self._gerenciar_ciclo_caixa(frame)
-                
-                # --- LÓGICA DE VISUALIZAÇÃO ---
-                cv2.putText(frame, f"Contagem: {contagem}", (20, 40), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-                cv2.putText(frame, f"Status: {self.status_caixa}", (20, 90), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+            if ret:
+                # Roda a detecção e desenha na tela
+                results = self.item_model(frame, verbose=False, conf=self.conf_threshold)
+                frame_desenhado = frame.copy() # Cria uma cópia para desenhar
 
-                if roi_desenho:
-                    x, y, w, h = roi_desenho
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 255), 3)
-                    cv2.putText(frame, "ROI Caixa", (x, y - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
+                # Loop manual para desenhar cada detecção
+                for box in results[0].boxes:
+                    x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+                    conf = float(box.conf)
+                    cls = int(box.cls)
+                    label = f'{self.item_model.names[cls]} {conf:.2f}'
+                    
+                    # Define a cor baseada na classe (item = azul, divisor = ciano/amarelo)
+                    color = (255, 0, 0) if cls == 0 else (0, 255, 255)
 
-                cv2.imshow("Contador de Itens - YOLO", frame)
+                    # Desenha o retângulo e o texto
+                    cv2.rectangle(frame_desenhado, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame_desenhado, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                contagem, roi_desenho = self._gerenciar_ciclo_de_vida(frame)
+                self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho)
+
+                cv2.imshow('SIAC - Verificador de Caixas', frame_desenhado)
             else:
-                print("[INFO] Fim do vídeo. Pressione 'q' para sair ou 'a' para reiniciar.")
+                print("[AVISO] Fim do vídeo ou erro na captura.")
                 paused = True # Força a pausa no final
 
             # Lógica de controle de vídeo
@@ -224,111 +202,83 @@ class ContadorDeItens:
             if not paused:
                 ret, frame = self.cap.read()
 
-    def _loop_live_camera(self):
+    def _loop_live_camera(self, video_source):
         """
         Loop de processamento para câmera ao vivo.
-        Pressione 'q' para sair.
+        'q': Sair.
         """
+        self.cap = cv2.VideoCapture(video_source)
+        if not self.cap.isOpened():
+            print("[ERRO] Não foi possível abrir a fonte de vídeo.")
+            return
+
         while True:
             ret, frame = self.cap.read()
             if not ret:
                 print("[ERRO] Não foi possível ler o frame da câmera. Encerrando.")
                 break
 
-            # --- LÓGICA DE DETECÇÃO ---
-            contagem, roi_desenho = self._gerenciar_ciclo_caixa(frame)
+            # Roda a detecção e desenha na tela
+            results = self.item_model(frame, verbose=False, conf=self.conf_threshold)
+            frame_desenhado = frame.copy() # Cria uma cópia para desenhar
 
-            # --- LÓGICA DE VISUALIZAÇÃO ---
-            cv2.putText(frame, f"Contagem: {contagem}", (20, 40), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            cv2.putText(frame, f"Status: {self.status_caixa}", (20, 90), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+            # Loop manual para desenhar cada detecção
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+                conf = float(box.conf)
+                cls = int(box.cls)
+                label = f'{self.item_model.names[cls]} {conf:.2f}'
+                
+                # Define a cor baseada na classe (item = azul, divisor = ciano/amarelo)
+                color = (255, 0, 0) if cls == 0 else (0, 255, 255)
 
-            if roi_desenho:
-                x, y, w, h = roi_desenho
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 255), 3)
-                cv2.putText(frame, "ROI Caixa", (x, y - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
+                # Desenha o retângulo e o texto
+                cv2.rectangle(frame_desenhado, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame_desenhado, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            cv2.imshow("Contador de Itens - YOLO", frame)
+            contagem, roi_desenho = self._gerenciar_ciclo_de_vida(frame)
+            self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho)
+
+            cv2.imshow('SIAC - Verificador de Caixas', frame_desenhado)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-    def _processar_imagem_unica(self):
-        """
-        Processa uma única imagem estática.
-        """
-        print("[INFO] Iniciando modo Imagem Estática.")
-        frame = cv2.imread(self.video_source)
-        if frame is None:
-            print(f"[ERRO] Não foi possível ler o arquivo de imagem: {self.video_source}")
-            return
-
-        # --- LÓGICA DE DETECÇÃO ---
-        # O modo de imagem estática não usa o ciclo de vida, apenas a detecção simples.
-        caixa_roi_detectada = self._detectar_caixa_roi(frame)
-        results = self.item_model(frame, verbose=False)
-        result = results[0]
-        frame_vis = result.plot()
-        
-        contagem = self._contar_itens_na_roi(result, caixa_roi_detectada)
-
-        # --- LÓGICA DE VISUALIZAÇÃO ---
-        cv2.putText(frame_vis, f"Contagem: {contagem}", (20, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-
-        if caixa_roi_detectada:
-            x, y, w, h = caixa_roi_detectada
-            cv2.rectangle(frame_vis, (x, y), (x + w, y + h), (255, 0, 255), 3)
-            cv2.putText(frame_vis, "ROI Caixa", (x, y - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
-
-        cv2.imshow("Contador de Itens - YOLO", frame_vis)
-        print("[INFO] Pressione qualquer tecla para fechar a imagem.")
-        cv2.waitKey(0) # Espera indefinidamente por uma tecla
-
-    def run(self):
-        """
-        Inicia o processamento, escolhendo o loop apropriado (vídeo, câmera ou imagem).
-        """
-        if self.is_image:
-            self._processar_imagem_unica()
-        elif self.is_live:
-            print("[INFO] Iniciando modo Câmera ao Vivo. Pressione 'q' para sair.")
-            self._loop_live_camera()
-        else:
-            print("[INFO] Iniciando modo Arquivo de Vídeo.")
-            self._loop_video_file()
-        
-        if self.cap:
-            self.cap.release()
-        cv2.destroyAllWindows()
-
-
-# Execução do sistema
-if __name__ == "__main__":
+if __name__ == '__main__':
     # --- CONFIGURAÇÕES ---
     USAR_CAMERA = True
-    CAMINHO_VIDEO = "caminho/para/seu/video.mp4"
-    CAMINHO_IMAGEM = "caminho/para/sua/imagem.jpg"
-    MODELO_ITENS = 'runs/detect/contador_itens_aug2/weights/best.pt'
-    MODELO_ROI = 'runs/detect/roi_detector_final2/weights/best.pt' # CAMINHO CORRIGIDO
+    CAMINHO_VIDEO = 'videos/video_teste_contagem_02.mp4'
+    # Para testar o modelo em uma imagem específica do dataset
+    CAMINHO_IMAGEM = None
+    # Limite de confiança para considerar uma detecção válida
+    LIMITE_CONFIANCA = 0.4
 
     # Perfil da caixa a ser verificado
     perfil = {
-        'nome': 'Caixa Padrão', 
-        'itens_esperados': 12
+        "nome": "Caixa Padrão",
+        "itens_esperados": 12,
+        "total_camadas": 3
     }
-    # -------------------- #
 
-    if USAR_CAMERA:
-        source = 0
-    else:
-        source = CAMINHO_VIDEO
+    # --- INICIALIZAÇÃO E EXECUÇÃO ---
+    contador = ContadorDeItens(
+        item_model_path='runs/detect/modelo_producao_v1/weights/best.pt',
+        roi_model_path='runs/detect/roi_detector_final2/weights/best.pt', # Atualize se necessário
+        perfil_caixa=perfil,
+        conf_threshold=LIMITE_CONFIANCA
+    )
 
-    contador = ContadorDeItens(video_source=source, 
-                               item_model_path=MODELO_ITENS, 
-                               roi_model_path=MODELO_ROI, 
-                               perfil_caixa=perfil)
-    contador.run()
+    try:
+        if USAR_CAMERA:
+            contador.run(video_source=0)
+        elif CAMINHO_IMAGEM:
+            contador.run(imagem_path=CAMINHO_IMAGEM)
+            # Se processamos uma imagem, precisamos esperar o usuário fechar a janela
+            print("\nPressione qualquer tecla na janela da imagem para sair.")
+            cv2.waitKey(0)
+        else:
+            # Se não for câmera e não for imagem, assume que é vídeo
+            contador.run(video_source=CAMINHO_VIDEO)
+    finally:
+        # Garante que todas as janelas do OpenCV sejam fechadas ao final
+        cv2.destroyAllWindows()
