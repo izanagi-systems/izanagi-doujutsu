@@ -1,22 +1,20 @@
 import os
-# SOLUÇÃO DEFINITIVA PARA ERRO DE REDE: Impede a biblioteca de verificar atualizações online.
+# Impede a biblioteca de verificar atualizações online.
 os.environ['ULTRALYTICS_SYNC'] = 'False'
 
 import cv2
-import os
 from ultralytics import YOLO
 import numpy as np
 from collections import deque
-import argparse
+import time
 
 class ContadorDeItens:
-    def __init__(self, item_model_path='runs/detect/contador_multiclasse_final/weights/best.pt', roi_model_path='path/to/roi_model.pt', perfil_caixa=None, timeout_alarme=50, conf_threshold=0.4):
+    def __init__(self, item_model_path='modelos_producao/item_detector.pt', roi_model_path='modelos_producao/roi_detector.pt', perfil_caixa=None, conf_threshold=0.4):
         """
         Inicializa o contador de itens.
         :param item_model_path: Caminho para o modelo YOLO treinado para contar itens.
         :param roi_model_path: Caminho para o modelo YOLO treinado para detectar a caixa principal (ROI).
         :param perfil_caixa: Dicionário com o perfil da caixa (nome, itens_esperados).
-        :param timeout_alarme: Frames para esperar antes de alarmar.
         :param conf_threshold: Limite de confiança para detecções de itens.
         """
         print(f"[INFO] Carregando modelos...")
@@ -31,14 +29,27 @@ class ContadorDeItens:
         else:
             print("[AVISO] Nenhum perfil de caixa carregado. A contagem será apenas exibida.")
 
-        # --- Estados do Sistema ---
-        self.status_caixa = 'AGUARDANDO_CAIXA'
+        # --- Constantes de Desenho ---
+        self.CORES = {
+            'roi': (255, 0, 255),          # Rosa para ROI
+            'item_ok': (0, 255, 0),        # Verde para itens contados
+            'divisor': (0, 255, 255),      # Ciano/Amarelo para divisor
+            'texto_status': (0, 0, 0),     # Preto para status
+            'texto_contagem': (0, 0, 255)  # Vermelho para contagem
+        }
+        self.FONTE = cv2.FONT_HERSHEY_SIMPLEX
+        self.ESCALA_FONTE_INFO = 0.7
+        self.ESPESSURA_LINHA = 2
+
+        # --- Máquina de Estados --- 
+        self.status_sistema = 'AGUARDANDO_CAIXA' # Estados: AGUARDANDO_CAIXA, CONTANDO_ITENS, AGUARDANDO_DIVISOR, AVALIACAO_FINAL
         self.roi_atual = None
-        self.roi_travada = False
-        self.frames_sem_roi = 0
-        self.timeout_sem_roi = timeout_alarme # Frames para esperar antes de resetar
-        self.contagem_buffer = deque(maxlen=15) # Buffer para suavizar a contagem
+
+        # --- Controle de Camadas e Contagem ---
         self.camada_atual = 1
+        self.contagens_por_camada = [] # Armazena a contagem final de cada camada
+        self.contagem_buffer = deque(maxlen=10) # Buffer para suavizar a contagem de itens
+        self.divisor_buffer = deque(maxlen=10)  # Buffer para confirmar detecção do divisor
 
     def run(self, imagem_path=None, video_source=0):
         if imagem_path:
@@ -66,120 +77,52 @@ class ContadorDeItens:
 
         # Loop manual para desenhar cada detecção
         for box in results[0].boxes:
-            x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
-            conf = float(box.conf)
             cls = int(box.cls)
-            label = f'{self.item_model.names[cls]} {conf:.2f}'
-            
-            # Define a cor baseada na classe (item = azul, divisor = ciano/amarelo)
-            color = (255, 0, 0) if cls == 0 else (0, 255, 255)
+            # Desenha o contorno apenas para a classe 'divisor'
+            if self.item_model.names[cls] == 'divisor':
+                x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+                conf = float(box.conf)
+                label = f'divisor {conf:.2f}'
+                color = self.CORES['divisor'] # Ciano/Amarelo
 
-            # Desenha o retângulo e o texto
-            cv2.rectangle(frame_desenhado, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame_desenhado, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # Desenha o retângulo e o texto
+                cv2.rectangle(frame_desenhado, (x1, y1), (x2, y2), color, self.ESPESSURA_LINHA)
+                cv2.putText(frame_desenhado, label, (x1, y1 - 10), self.FONTE, 0.5, color, self.ESPESSURA_LINHA)
 
-        contagem, roi_desenho = self._gerenciar_ciclo_de_vida(frame)
-        self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho)
+        contagem, roi_desenho, divisores = self._gerenciar_ciclo_de_vida(frame)
+        self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho, divisores)
 
         cv2.imshow('SIAC - Verificador de Caixas', frame_desenhado)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
-    def _gerenciar_ciclo_de_vida(self, frame):
-        """
-        Gerencia o estado da detecção da caixa (ROI) e a contagem de itens.
-        Retorna a contagem de itens e as coordenadas da ROI para desenho.
-        """
-        # 1. Detectar a ROI (caixa principal)
-        roi_results = self.roi_model(frame, verbose=False, conf=0.5)
-        caixas_detectadas = roi_results[0].boxes.xyxy
-        
-        roi_para_desenho = None
-        contagem_final = 0
-
-        if len(caixas_detectadas) > 0:
-            # Pega a maior caixa detectada como a ROI principal
-            areas = [(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in caixas_detectadas]
-            maior_caixa_idx = np.argmax(areas)
-            x1, y1, x2, y2 = caixas_detectadas[maior_caixa_idx]
-            self.roi_atual = [int(x1), int(y1), int(x2), int(y2)]
-            roi_para_desenho = self.roi_atual
-            self.frames_sem_roi = 0
-            self.status_caixa = 'CAIXA_PRESENTE'
-
-        else: # Nenhuma caixa detectada
-            self.frames_sem_roi += 1
-            if self.frames_sem_roi > self.timeout_sem_roi:
-                # Se a caixa sumiu por tempo suficiente, reseta o estado
-                self.status_caixa = 'AGUARDANDO_CAIXA'
-                self.roi_atual = None
-                self.contagem_buffer.clear()
-                self.camada_atual = 1
-
-        # 2. Se a caixa está presente, conta os itens dentro dela
-        if self.status_caixa == 'CAIXA_PRESENTE' and self.roi_atual:
-            x1, y1, x2, y2 = self.roi_atual
-            roi_frame = frame[y1:y2, x1:x2]
-
-            if roi_frame.size > 0:
-                item_results = self.item_model(roi_frame, verbose=False, conf=self.conf_threshold)
-                # Filtra apenas a classe 'item' (ID 0)
-                contagem_itens = sum(1 for box in item_results[0].boxes if int(box.cls) == 0)
-                self.contagem_buffer.append(contagem_itens)
-            
-            # Usa a média do buffer para estabilizar a contagem
-            if self.contagem_buffer:
-                contagem_final = int(np.mean(self.contagem_buffer))
-            else:
-                contagem_final = 0
-        
-        return contagem_final, roi_para_desenho
-
-    def _desenhar_visualizacoes(self, frame, contagem, roi_desenho):
-        """
-        Desenha as informações de contagem e ROI no frame.
-{{ ... }}
-            cv2.putText(frame, "ROI Caixa", (x, y - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
-        """
-    def _loop_video_file(self, video_source):
-        """
-        Loop de processamento para arquivos de vídeo com controles de player.
-        Espaço: Play/Pause. 'd'/'a': Frame a frame (quando pausado). 'q': Sair.
-        """
-        self.cap = cv2.VideoCapture(video_source)
-        if not self.cap.isOpened():
-            print(f"[ERRO] Não foi possível abrir o arquivo de vídeo: {video_source}")
+    def _loop_video_file(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"[ERRO] Não foi possível abrir o vídeo: {video_path}")
             return
 
-        paused = True
-        ret, frame = self.cap.read()
+        paused = False
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         while True:
-            if ret:
-                # Roda a detecção e desenha na tela
-                results = self.item_model(frame, verbose=False, conf=self.conf_threshold)
-                frame_desenhado = frame.copy() # Cria uma cópia para desenhar
+            if not paused:
+                ret, frame = cap.read()
+                if not ret:
+                    print("[INFO] Fim do vídeo. Reiniciando em 5 segundos...")
+                    time.sleep(5)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
 
-                # Loop manual para desenhar cada detecção
-                for box in results[0].boxes:
-                    x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
-                    conf = float(box.conf)
-                    cls = int(box.cls)
-                    label = f'{self.item_model.names[cls]} {conf:.2f}'
-                    
-                    # Define a cor baseada na classe (item = azul, divisor = ciano/amarelo)
-                    color = (255, 0, 0) if cls == 0 else (0, 255, 255)
+                frame_desenhado = frame.copy()
+                contagem, roi_desenho, divisores = self._gerenciar_ciclo_de_vida(frame)
+                self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho, divisores)
 
-                    # Desenha o retângulo e o texto
-                    cv2.rectangle(frame_desenhado, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame_desenhado, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                contagem, roi_desenho = self._gerenciar_ciclo_de_vida(frame)
-                self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho)
+                # Adiciona informações de navegação no vídeo
+                current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                cv2.putText(frame_desenhado, f"Frame {current_frame_num}/{total_frames}", (10, 90), self.FONTE, 0.7, (0, 0, 0), self.ESPESSURA_LINHA)
 
                 cv2.imshow('SIAC - Verificador de Caixas', frame_desenhado)
-            else:
-                print("[AVISO] Fim do vídeo ou erro na captura.")
-                paused = True # Força a pausa no final
 
             # Lógica de controle de vídeo
             if paused:
@@ -192,15 +135,15 @@ class ContadorDeItens:
             elif key == ord(' '):
                 paused = not paused
             elif key == ord('d') and paused:
-                ret, frame = self.cap.read()
+                ret, frame = cap.read()
             elif key == ord('a'):
-                pos_atual = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
+                pos_atual = cap.get(cv2.CAP_PROP_POS_FRAMES)
                 pos_anterior = max(0, pos_atual - 2)
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, pos_anterior)
-                ret, frame = self.cap.read()
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos_anterior)
+                ret, frame = cap.read()
             
             if not paused:
-                ret, frame = self.cap.read()
+                ret, frame = cap.read()
 
     def _loop_live_camera(self, video_source):
         """
@@ -215,45 +158,129 @@ class ContadorDeItens:
         while True:
             ret, frame = self.cap.read()
             if not ret:
-                print("[ERRO] Não foi possível ler o frame da câmera. Encerrando.")
+                print("[ERRO] Não foi possível capturar o frame da câmera.")
                 break
 
-            # Roda a detecção e desenha na tela
-            results = self.item_model(frame, verbose=False, conf=self.conf_threshold)
-            frame_desenhado = frame.copy() # Cria uma cópia para desenhar
-
-            # Loop manual para desenhar cada detecção
-            for box in results[0].boxes:
-                x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
-                conf = float(box.conf)
-                cls = int(box.cls)
-                label = f'{self.item_model.names[cls]} {conf:.2f}'
-                
-                # Define a cor baseada na classe (item = azul, divisor = ciano/amarelo)
-                color = (255, 0, 0) if cls == 0 else (0, 255, 255)
-
-                # Desenha o retângulo e o texto
-                cv2.rectangle(frame_desenhado, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame_desenhado, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-            contagem, roi_desenho = self._gerenciar_ciclo_de_vida(frame)
-            self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho)
+            frame_desenhado = frame.copy()
+            contagem, roi_desenho, divisores = self._gerenciar_ciclo_de_vida(frame)
+            self._desenhar_visualizacoes(frame_desenhado, contagem, roi_desenho, divisores)
 
             cv2.imshow('SIAC - Verificador de Caixas', frame_desenhado)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+    def _gerenciar_ciclo_de_vida(self, frame):
+        """
+        Gerencia o estado da detecção da caixa (ROI) e a contagem de itens.
+        Retorna a contagem de itens, as coordenadas da ROI e os divisores detectados.
+        """
+        # Etapa 1: Detectar TODOS os objetos no frame inteiro, uma única vez.
+        results = self.item_model(frame, verbose=False, conf=self.conf_threshold)
+        todos_itens = []
+        todos_divisores = []
+        for box in results[0].boxes:
+            coords = [int(i) for i in box.xyxy[0]]
+            if int(box.cls) == 0: # item
+                todos_itens.append(coords)
+            elif int(box.cls) == 1: # divisor
+                todos_divisores.append(coords)
+
+        # Etapa 2: Detectar a ROI (caixa principal) consistentemente
+        roi_detectada = self._detectar_roi_estavel(frame)
+        contagem_display = 0
+
+        # --- Início da Máquina de Estados ---
+
+        if self.status_sistema == 'AGUARDANDO_CAIXA':
+            if roi_detectada:
+                print("[STATUS] Caixa detectada. Iniciando contagem da camada 1...")
+                self.status_sistema = 'CONTANDO_ITENS'
+                self.roi_atual = roi_detectada
+                self.camada_atual = 1
+                self.contagens_por_camada = []
+                self.contagem_buffer.clear()
+                self.divisor_buffer.clear()
+
+        elif self.status_sistema == 'CONTANDO_ITENS':
+            # Se a caixa ainda está visível, continua o processo
+            if roi_detectada:
+                self.roi_atual = roi_detectada # Atualiza a posição da ROI
+
+                # Filtra os itens que estão DENTRO da ROI atual
+                itens_na_roi = []
+                rx1, ry1, rx2, ry2 = self.roi_atual
+                for item_box in todos_itens:
+                    ix1, iy1, ix2, iy2 = item_box
+                    # Usa o centro do item para verificar se está na ROI
+                    centro_x = (ix1 + ix2) / 2
+                    centro_y = (iy1 + iy2) / 2
+                    if rx1 < centro_x < rx2 and ry1 < centro_y < ry2:
+                        itens_na_roi.append(item_box)
+                
+                self.contagem_buffer.append(len(itens_na_roi))
+
+            else: # Caixa foi perdida
+                print("[STATUS] Caixa removida. Aguardando nova caixa...")
+                self.status_sistema = 'AGUARDANDO_CAIXA'
+                self.roi_atual = None
+
+            # Usa a média do buffer para estabilizar a contagem no display
+            if self.contagem_buffer:
+                contagem_display = int(np.mean(self.contagem_buffer))
+
+        elif self.status_sistema == 'AGUARDANDO_DIVISOR':
+            contagem_display = self.contagens_por_camada[-1] if self.contagens_por_camada else 0
+
+        # Retorna os dados para a função de desenho
+        return contagem_display, self.roi_atual, todos_divisores
+
+    def _detectar_roi_estavel(self, frame):
+        """
+        Usa o modelo YOLO para detectar a ROI. 
+        Retorna as coordenadas da maior caixa detectada, ou None se nenhuma for encontrada.
+        """
+        roi_results = self.roi_model(frame, verbose=False, conf=0.5)
+        caixas_detectadas = roi_results[0].boxes.xyxy
+
+        if len(caixas_detectadas) > 0:
+            # Pega a maior caixa detectada como a ROI principal
+            areas = [(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in caixas_detectadas]
+            maior_caixa_idx = np.argmax(areas)
+            x1, y1, x2, y2 = caixas_detectadas[maior_caixa_idx]
+            return [int(x1), int(y1), int(x2), int(y2)]
+        
+        return None
+
+    def _desenhar_visualizacoes(self, frame, contagem, roi_desenho, divisores):
+        """
+        Desenha todas as informações visuais no frame: ROI, contagem, status e divisores.
+        """
+        # Desenha a ROI
+        if roi_desenho:
+            x1, y1, x2, y2 = roi_desenho
+            cv2.rectangle(frame, (x1, y1), (x2, y2), self.CORES['roi'], self.ESPESSURA_LINHA) # Cor Rosa/Magenta
+            cv2.putText(frame, "ROI Caixa", (x1, y1 - 10), 
+                        self.FONTE, self.ESCALA_FONTE_INFO, self.CORES['roi'], self.ESPESSURA_LINHA)
+
+        # Desenha o status do sistema e a contagem
+        status_texto = f"Status: {self.status_sistema}"
+        contagem_texto = f"Itens Camada {self.camada_atual}: {contagem}"
+        cv2.putText(frame, status_texto, (10, 30), self.FONTE, self.ESCALA_FONTE_INFO, self.CORES['texto_status'], self.ESPESSURA_LINHA)
+        cv2.putText(frame, contagem_texto, (10, 60), self.FONTE, self.ESCALA_FONTE_INFO, self.CORES['texto_contagem'], self.ESPESSURA_LINHA)
+
+        # Desenha os divisores
+        for d in divisores:
+            x1, y1, x2, y2 = d
+            cv2.rectangle(frame, (x1, y1), (x2, y2), self.CORES['divisor'], self.ESPESSURA_LINHA) # Cor Ciano/Amarelo
+            cv2.putText(frame, 'divisor', (x1, y1 - 10), self.FONTE, 0.5, self.CORES['divisor'], self.ESPESSURA_LINHA)
+
 if __name__ == '__main__':
     # --- CONFIGURAÇÕES ---
-    USAR_CAMERA = True
-    CAMINHO_VIDEO = 'videos/video_teste_contagem_02.mp4'
-    # Para testar o modelo em uma imagem específica do dataset
-    CAMINHO_IMAGEM = None
-    # Limite de confiança para considerar uma detecção válida
-    LIMITE_CONFIANCA = 0.4
-
-    # Perfil da caixa a ser verificado
+    # Define o perfil da caixa (o que se espera que ela contenha)
     perfil = {
         "nome": "Caixa Padrão",
         "itens_esperados": 12,
@@ -262,23 +289,14 @@ if __name__ == '__main__':
 
     # --- INICIALIZAÇÃO E EXECUÇÃO ---
     contador = ContadorDeItens(
-        item_model_path='runs/detect/modelo_producao_v1/weights/best.pt',
-        roi_model_path='runs/detect/roi_detector_final2/weights/best.pt', # Atualize se necessário
+        item_model_path='modelos_producao/item_detector.pt',
+        roi_model_path='modelos_producao/roi_detector.pt',
         perfil_caixa=perfil,
-        conf_threshold=LIMITE_CONFIANCA
+        conf_threshold=0.4
     )
 
     try:
-        if USAR_CAMERA:
-            contador.run(video_source=0)
-        elif CAMINHO_IMAGEM:
-            contador.run(imagem_path=CAMINHO_IMAGEM)
-            # Se processamos uma imagem, precisamos esperar o usuário fechar a janela
-            print("\nPressione qualquer tecla na janela da imagem para sair.")
-            cv2.waitKey(0)
-        else:
-            # Se não for câmera e não for imagem, assume que é vídeo
-            contador.run(video_source=CAMINHO_VIDEO)
+        contador.run(video_source=0)
     finally:
         # Garante que todas as janelas do OpenCV sejam fechadas ao final
         cv2.destroyAllWindows()
