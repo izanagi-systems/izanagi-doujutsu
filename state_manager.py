@@ -59,10 +59,19 @@ class StateManager:
                 print("[STATUS] Caixa ausente durante a contagem. Iniciando temporizador.")
                 self._transitar_para(ESTADOS['CAIXA_AUSENTE'])
                 self.caixa_ausente_desde = time.time()
-                # self.ultima_roi_conhecida = ... (lógica para salvar a posição exata pode ser adicionada aqui)
                 return
 
-            # Verifica se a camada está completa
+            # Defesa Nível 2: A contagem só é válida se as condições forem atendidas.
+            # Para a camada 1, o divisor não é necessário.
+            # Para camadas > 1, o divisor DEVE estar estável.
+            condicao_contagem_valida = (self.camada_atual == 1) or (self.camada_atual > 1 and divisor_estavel)
+
+            if not condicao_contagem_valida:
+                print(f"[ALERTA] Divisor ausente na camada {self.camada_atual}. Contagem pausada.")
+                self._transitar_para(ESTADOS['ALERTA_DIVISOR_AUSENTE'])
+                return
+
+            # Se a contagem é válida, verificamos se a camada está completa
             if self.contagem_estabilizada >= PERFIL_CAIXA['itens_esperados']:
                 print(f"[STATUS] Camada {self.camada_atual} completa. Aguardando divisor.")
                 self._transitar_para(ESTADOS['AGUARDANDO_DIVISOR'])
@@ -85,7 +94,17 @@ class StateManager:
                 else:
                     self.camada_atual += 1
                     print(f"[STATUS] Iniciando contagem para a camada {self.camada_atual}.")
+                    self.buffer_contagem_itens.clear()  # Zera a contagem para a nova camada
                     self._transitar_para(ESTADOS['CONTANDO_ITENS'])
+
+        elif estado_atual == ESTADOS['ALERTA_DIVISOR_AUSENTE']:
+            if divisor_estavel:
+                print(f"[STATUS] Divisor detectado. Retomando contagem da camada {self.camada_atual}.")
+                self._transitar_para(ESTADOS['CONTANDO_ITENS'])
+            elif not roi_estavel:
+                print("[STATUS] Caixa removida durante o alerta de divisor. Pausando.")
+                self._transitar_para(ESTADOS['CAIXA_AUSENTE'])
+                self.caixa_ausente_desde = time.time()
 
         elif estado_atual == ESTADOS['CAIXA_COMPLETA']:
             # O sistema aguarda a caixa ser removida para reiniciar o ciclo.
