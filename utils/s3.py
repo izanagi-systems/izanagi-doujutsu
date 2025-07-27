@@ -36,5 +36,5 @@ class S3:
 
 if __name__ == "__main__":
     downloader = S3()
-    downloader.download_data(local_dir="./data_s3")
+    downloader.download_data(local_dir="./tmp")
 

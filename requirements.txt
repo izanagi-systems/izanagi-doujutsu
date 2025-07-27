@@ -1,3 +1,5 @@
 opencv-contrib-python
 numpy
 ultralytics
+boto3
+dotenv
