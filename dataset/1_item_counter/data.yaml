@@ -1,10 +1,10 @@
-# Configuração para o dataset de contagem de itens
-path: 'c:/Users/ti-005/Desktop/pvcf_gpt/dataset/1_item_counter'
+# Configuração para o dataset de contagem de itens e divisórias
+path: 'c:/Users/ti-005/Desktop/projeto_vc_fabril/dataset/1_item_counter'
 
-# Pastas de treino e validação (relativas ao 'path')
+# Pastas de treino e validação (YOLO fará a divisão automática)
 train: images
 val: images
 
 # Definição das Classes
-nc: 1
-names: ['item']
+nc: 2
+names: ['item', 'divisor']

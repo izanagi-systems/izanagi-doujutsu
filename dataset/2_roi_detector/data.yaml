@@ -1,7 +1,7 @@
 # Configuração para o dataset de detecção da ROI (caixa principal)
-path: 'c:/Users/ti-005/Desktop/pvcf_gpt/dataset/2_roi_detector'
+path: 'c:/Users/ti-005/Desktop/projeto_vc_fabril/dataset/2_roi_detector'
 
-# Pastas de treino e validação (relativas ao 'path')
+# Pastas de treino e validação (relativas à raiz do projeto)
 train: images
 val: images
 
